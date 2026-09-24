@@ -1,154 +1,61 @@
-# Dotfiles
+The user asks: is this project clever/ingenious, or is it reinventing the wheel? They want an honest analysis of the dots Rust CLI vs existing dotfile managers (GNU Stow, chezmoi, dotbot, yadm, Nix home-manager, tuckr, etc.).
 
-跨平台个人 dotfiles 仓库，管理入口是自写的 Rust CLI **`dots`**（源码在 `cli/`）。
+I should give a balanced, honest technical assessment. Let me think about what I know from the README and structure:
 
-核心机制是**软链接镜像**：`tree/` 下的目录结构镜像 `$HOME`，仓库即配置的单一真相源。`dots sync` 把它们链接到位——编辑仓库即生效，无需复制、无需重新安装。
+Existing tools:
+- GNU Stow: symlink farms, stow/unstow packages. No state, no drift detection, no platform layering (manual), no declarative config.
+- dotbot: YAML config, runs link/clean/shell directives. Declarative but no inventory, no collision/drift model, plugins via shell.
+- chezmoi: Go, template-based (not symlink-first by default), single-file state, encrypted secrets, very feature-rich. Uses source state → target state model, has apply/diff/doctor. Actually chezmoi has a very similar model: source state, target state, config file (TOML), scripts (run_ once vs run_ run), templates with data. But chezmoi's default is content-managed files, not symlinks (though has symlink_ attribute).
+- yadm: git wrapper, templates, alt-files for platform layering (##os, ##class). Platform layering via naming convention — similar to home.linux/home.macos.
+- tuckr: Rust symlink-based dotfiles manager (similar to stow in Rust).
+- Nix home-manager: fully declarative, reproducible, but heavy.
+- meta / dotify / etc.
 
-仓库不安装系统包、rustup、Node、pnpm 或 AI CLI。`bootstrap.sh` 要求本机已有 `cc`、Cargo、Node 22.19+ 与 pnpm 11.18。`dots install` 执行 `dots.lua` 中的 Cargo binary 安装声明；`dots sync` 先运行声明的 lifecycle hook，再收敛配置 Resource。当前 Pi hook 会按 frozen lockfile 自动安装 workspace 依赖。
+So what's the wheel-reinvention aspect? Core symlink mirroring + platform layers = yadm alt-files / stow / chezmoi features. That part is well-trodden.
 
-## 快速开始
+What's the clever part?
+1. Directory-as-declaration (tree/ mirrors $HOME) — same as stow/chezmoi(home dir approach), not novel.
+2. Declarative reconcile model with Applied Inventory, Collision, Drift, ownership takeover, forget — this is a mini desired-state reconciler. chezmoi actually has similar semantics (it tracks state in its database, apply computes diff). dotbot doesn't. This is solid engineering but chezmoi covers most of it.
+3. Lua as exception/config language with typed API stubs (.luarc + dots.meta.lua for editor completion) — this is a genuinely nice touch; chezmoi uses TOML config + Go templates (not Turing-complete by design), dotbot YAML. Lua gives programmatic granularity rules without shell hooks. mlua embedding in Rust is clean.
+4. The resource model (managed_block, systemd_user_unit, copied_file) — chezmoi has managed blocks? Actually chezmoi doesn't have managed-block; it has templates. Managed block is more like the " markers in config files" — that's a nice small feature.
+5. cargo_binary install declarations — chezmoi doesn't do package management (by design); Brewfile/aptfile handled outside. So a small crated feature.
+6. The agent-hooks crate (PreToolUse guard shared across Codex/Kimi/Pi) — this is NOT reinventing anything; it's adapting to a very new ecosystem (AI CLI hooks), genuinely timely and unique. The pretool.toml heuristics guard.
+7. The pi subagent-workflow extension — again novel territory, no wheel exists.
+8. minijinja injection for consumers that can't read shell env (systemd units) — chezmoi templates do this universally; here it's deliberately minimal (strict mode, .inject suffix). Restraint is the design choice.
+9. Platform layering at entry level (home.linux overrides home) — yadm does this with ## suffixes; elegant here via directory naming.
+10. Link granularity heuristics (file vs children vs dir) with per-path overrides — stow always symlinks whole dirs or files (folding), chezmoi similar. The heuristic of first-level config dirs as containers is practical.
 
-本机预先装好 C 编译器、Rust/Cargo、Node 22.19+ 和 pnpm 11.18 后：
+The honest verdict: the dotfile-management core is ~70% reinvention relative to chezmoi (which already has: source→target state, diff/apply, drift-ish doctor, templates, scripts, secrets, encryption, cross-platform incl. Windows). If the goal were purely "manage my dotfiles with least effort", chezmoi or even yadm would suffice, and Nix home-manager is the fully declarative endgame. BUT: the value is not in replacing chezmoi feature-for-feature; it's:
+- Control and auditability of a small, strict engine (the user is strong in Rust; the codebase is a showcase of clean architecture: dots-core pure logic, plan/reconcile separation, e2e tests).
+- Deliberately narrower semantics: no templates except strict minijinja for systemd units; no secrets management; no package management except cargo binaries. chezmoi's flexibility is also its complexity; a personal engine can guarantee exact behavior.
+- The genuinely novel parts are the AI-toolchain integration: shared PreToolUse engine for three AI CLIs, skills distribution to multiple agent dirs (distribute), the Pi extension suite. No existing dotfiles manager addresses "managing AI agent configs/skills/hooks" because it's new. The README's .agents as single source of truth distributing to codex/kimi/pi is forward-looking — this is where the project has real originality in 2026.
+- Learning/showcase value: writing a reconcile engine with inventory, drift, collision, dry-run, Lua embedding is excellent Rust architecture practice.
 
-```bash
-git clone <your-repo-url> ~/dotfiles
-~/dotfiles/bootstrap.sh
-```
+Also design details worth praising:
+- README is symlink to docs/README.md
+- lua-api as type stubs only for editor completion — clean separation of code and DX.
+- dry-run/status sharing the same planner (status = read-only plan) — good consistency.
+- forget semantics precisely defined (inventory-only, no touching real objects).
+- The rule "CLI never writes dots.lua" — human-owned declaration.
+- Collision auto-adoption when identical — thoughtful.
 
-`bootstrap.sh` 检查 `cc` 与 `cargo`，执行 `cargo build --release`，再依次运行 `dots install` 和 `dots sync`。bootstrap 不自举系统包、Rust、Node、pnpm 或 AI CLI；sync 的 Pi hook 使用本机已有的 pnpm 安装 workspace 依赖。
+Weaknesses / wheel duplication:
+- Cross-platform claim vs Windows: README says 跨平台, tree has home/home.linux/home.macos — no home.windows. The repo lives on Windows now (paths show d:\), but targets are mac/linux (Hyprland, yabai, zsh). So on this Windows machine it can't really sync; the "跨平台" is linux+macos. Minor caveat.
+- No encryption/secrets (op/knox) — chezmoi has it; but user may not need.
+- Hook system + cargo install overlaps with plain shell scripts (e.g., a Makefile or install.sh could do cargo install) — small.
+- Maintenance cost: custom tool = you own the bugs. Mitigated by e2e tests.
 
-已有环境日常按需执行：
+Verdict formulation: 混合。主干（链接镜像+平台分层）确实是再造轮子，且 chezmoi 覆盖面大得多；巧思不在"管理 dotfiles"这个命题本身，而在三点：1) 把声明式收敛语义做小做严（inventory/collision/drift/forget 的边界定义得比多数工具清楚），2) Lua 例外层 + 类型标注的 DX 设计，3) 真正新的问题域——AI CLI 的 skills/hooks/agents 配置分发与共享守卫，这块没有现成轮子。以及作为 Rust 架构练习的价值。若纯论效率，用 chezmoi 更省；但这个项目的价值主张不是省事，是掌控与新领域。
 
-```bash
-cd ~/dotfiles
-./dots.sh install          # 安装或升级声明的 Cargo binary
-./dots.sh sync --dry-run   # 先看会做什么
-./dots.sh sync             # 实际执行
-```
+Keep it dense, plain prose, no markdown formatting per user rules, Chinese, concise but detailed. Maybe 4-6 short paragraphs. No tables, no bold, no emoji, no headers? "ban markdown" — I'll write plain paragraphs. Keep code refs minimal (already discussed files). Length: medium — this is an analysis question, deserve substance but stay tight.
+一半一半。主干确实在造已有的轮子，巧思在别处。
 
-`dots.sh` 是开发期透传脚本（`cargo run --release`，自动编译）。编译产物在 `cli/target/release/dots`——想直接敲 `dots <子命令>` 需自行把它加进 PATH 或建链（bootstrap 不代劳）。
+先说重复的部分。符号链接镜像 + 平台分层是 dotfile 工具的标准玩法：GNU stow 三十年前就在做链接农场，yadm 的 ## 后缀就是 home.linux 这套命名分层的等价物，chezmoi 更是把「源状态到目标状态收敛」这个模型做成了大而全——diff/apply/doctor、模板、加密、机密管理、跨平台，全都有。单论「管理 dotfiles」这个命题本身，用 chezmoi 或 yadm 一天就能配出等效效果，自写引擎在这个维度上是净亏损：你从此自己拥有所有 bug。
 
-日常跳转有两个 alias（由 `.zshrc_dotfiles` 提供）：`dot` cd 到仓库根，`skill` cd 到 skills 目录。
+但有三处是真有价值的。第一，语义边界定义得比多数现成工具干净：Applied Inventory 支撑删除与 Drift 判定、与声明完全一致的链接自动接管、不一致报 Collision 不覆盖、forget 只放弃 ownership 不碰真实对象、status 是 sync plan 的只读投影——这是一套小型期望状态收敛器的严格语义，dotbot 和 stow 根本没有状态概念，chezmoi 有但藏在庞大实现里。把这套东西做小做严、配上 e2e 测试，是掌控力的问题，不是功能数量的问题。刻意不做的东西也很清醒：除 systemd unit 的 strict minijinja 外零模板、不做机密、不装系统包，避免了 chezmoi 式的复杂度蔓延。
 
-## 命令一览
+第二，Lua 例外层的设计有巧思。TOML/YAML 写不了「一级目录当容器下钻、其余整目录链」这种带逻辑的规则，Go 模板又刻意非图灵完备；用 mlua 嵌 Lua、CLI 永不回写 dots.lua、再用 .luarc 挂 dots.meta.lua 补类型——把声明语言、编辑器补全、人手所有权重塑顺了，这是配置系统设计里少见的干净解法。
 
-| 命令                     | 作用                                                               |
-| ------------------------ | ------------------------------------------------------------------ |
-| `dots install`           | 执行当前 Cargo binary 声明，只安装或升级，不卸载                    |
-| `dots sync [--dry-run]`  | 运行或预览 lifecycle hook，把配置 Resource 的 Desired Set 收敛到本机 |
-| `dots status`            | 只读展示与 sync 相同的创建、更新、删除、Collision 和 Drift Plan    |
-| `dots forget <resource>` | 不改真实对象，只从 Applied Inventory 放弃 ownership                |
+第三，也是真正的原创点：AI 工具链这块没有现成轮子可抄。tree/home/.agents 作为 skills 和全局指令的唯一真相源，distribute 到 codex/kimi 两个目录、Pi 直接发现；三个 AI CLI 共用一个 Rust PreToolUse 判定引擎，binary 吸收各 harness 的协议差异；pi/ 那套 subagent-workflow 更是完全新的问题域。2026 年管 AI agent 的配置、skill 分发和 hook 守卫，是 chezmoi 这代工具完全没覆盖的，这部分是先行者而非追随者。
 
-## 仓库结构
-
-```text
-dotfiles/
-├── dots.lua          # 例外清单（人手编辑，CLI 不写入）
-├── dots.sh           # 开发期透传（cargo run --release）
-├── bootstrap.sh      # 检查 cc/cargo → 编译 → dots install → dots sync
-├── cli/              # Rust workspace：crates/（dots-core 纯逻辑 + dots bin）、lua-api/（类型标注）
-├── pi/               # vanilla Pi 的 TypeScript extension source 与 pnpm workspace
-├── tree/             # ★ 映射根：目录结构即链接声明
-│   ├── home/         #   → $HOME（跨平台）
-│   ├── home.linux/   #   → $HOME（仅 Linux，条目级覆盖通用层）
-│   └── home.macos/   #   → $HOME（仅 macOS）
-├── scripts/          # 脚本源（common/ linux/ macos/），聚合到 .gen/scripts/ 进 PATH
-├── docs/             # 文档（本文件实际位置）
-├── .gen/   (不入库)  # 派生区：scripts/ 聚合软链、injected/ 模板渲染产物
-├── .dots/  (不入库)  # state.json Applied Inventory（删除与 Drift 判断依据）
-├── README.md         # → docs/README.md 的符号链接
-└── AGENTS.md         # 项目指令的真实源文件
-```
-
-## 映射规则
-
-`dots sync` 按四条规则工作：
-
-1. **纯 `$HOME` 镜像**：`tree/home/X` → `$HOME/X`；`tree/home.<os>/X` 仅在该平台生效，同名条目时平台层覆盖通用层。
-2. **链接粒度启发式**：文件直接链；层根的一级目录（如 `.config/`）是「容器」，下钻逐子项链；二级及更深目录（如 `.config/nvim/`）整目录链。
-3. **粒度覆盖**：启发式不对时在 `dots.lua` 写一行 `granularity(path, {mode=…, ignore=…})`。
-4. **链接判定**：未拥有且与声明完全一致的链接自动接管；未拥有且不同的目标报告 Collision，sync 不覆盖。
-
-## dots.lua（例外清单）
-
-约定盖不住的才写这里。可用 API：
-
-- `granularity(path, spec)` — 覆盖某路径的链接粒度（`mode = "dir" | "children" | "file"` + `ignore`）
-- `distribute(name, spec)` — 一源多落点（如 skills 同时分发到 codex / copilot）
-- `root(name, spec)` — 声明 `$HOME` 之外的映射层（罕用，如 macOS App Support）
-- `scripts { ignore_tree = … }` — 脚本聚合时递归拍平的子目录（子目录默认保持树形）
-- `dots.hook.before_sync(spec)` — 在真实 sync planning 前运行具名程序
-- `dots.resource.symlink/copied_file/managed_block/systemd_user_unit` — 由 sync 收敛的持续 Resource
-- `dots.resource.cargo_binary` — 由 `dots install` 执行的 Cargo binary 安装声明
-- `dots.path.exists(path)` — 声明阶段只读条件，用于 Resource 的 `enabled`
-
-完整参考见 [LUA_API.md](LUA_API.md)。Lua API 不提供任意 shell Action、run-once 状态、`dots.file.*`、`dots.cargo.build` 或 `dots.json.*`。
-
-`dots.lua` 维护需要安装的 Cargo binary 清单。`dots install` 把 crates.io 和 workspace 声明直接映射为 `cargo install`，由 Cargo 的安装 metadata 判断安装或升级；dots 不自动追加 `--force`。删除声明只会停止后续执行，不会卸载已经安装的 package。该清单不包含系统包、rustup、AI CLI、Node 或 pnpm。
-
-CLI 不编辑 `dots.lua`。编辑器类型补全由 `.luarc.json` 挂载 `cli/lua-api/dots.meta.lua` 提供。
-
-## 路径注入
-
-配置只引用「安装后路径」或自身相对路径，不使用模板路径占位符：
-
-- `dots sync` 写 `~/.config/dots/env.zsh`（export `DOTFILES_DIR` / `DOTS_SCRIPTS` + PATH），`.zshrc_dotfiles` 首行 source 它。
-- 读不到 shell 环境的消费者（systemd unit）才用模板：`.inject` 后缀 + minijinja `{{ }}`，可引用 `{{ DOTFILES }}`（仓库根）和 `{{ SCRIPTS }}`（聚合脚本目录），产物落 `.gen/injected/` 再链过去。缺变量直接报错（strict 模式）。
-
-## Zsh 结构
-
-- Zsh 不使用框架，显式启用 emacs 键模式。Ctrl-S 打开 live-grep，Ctrl-Q 打开临时 scratch，Ctrl-W/Ctrl-U 留空。
-- `tree/home/.config/zsh/` 按编号加载：`10-options.zsh` 管历史、目录、补全与键绑定；`20-functions.zsh` 管交互函数；`25-fzf-tab.zsh` 管 fzf 与 fzf-tab；`30-autosuggestions.zsh` 管历史建议；`40-aliases.zsh` 管别名；`90-syntax-highlighting.zsh` 必须最后加载。
-- `25-fzf-tab.zsh` 必须位于 compinit 和 `fzf --zsh` 之后、autosuggestions 之前。Ctrl-T 不绑定路径插入，Ctrl-F 选文件并进入 nvim。
-- `z` → zoxide；提示符 starship + 自写 transient prompt。
-- git diff 走 delta（`tree/home/.gitconfig` 受管，syntax-theme 复用 bat 主题库）；bat 主题 Catppuccin Mocha（`tree/home/.config/bat/config`），与 kitty/fzf 同色板。
-- 改主配置改 `tree/home/.zshrc_dotfiles`；平台差异改 `tree/home.linux/.zshrc_linux` / `tree/home.macos/.zshrc_macos`。
-
-`~/.zshrc` 中的 `dots-env` managed block 只负责 source `~/.zshrc_dotfiles`；block 外的 conda / nvm 等软件内容保留，不把它当主配置维护。
-
-## 修改配置的正确方式
-
-- **改已有配置**：直接编辑 `tree/` 下对应文件。已链接的文件改完即生效，无需重跑任何命令。
-- **加新配置**：把源文件放进 `tree/` 对应位置，再运行 `dots sync`。
-
-## Collision 与 Drift
-
-未拥有的目标位置已有内容时：
-
-- 与 Declaration 完全一致 → 自动接管，不重写
-- 与 Declaration 不同 → Collision，sync 不动；手工移走或删除陌生目标后再 sync
-
-已拥有的 Resource 偏离 Applied Inventory 时报告 Drift，不自动修复。Declaration 删除后，未漂移 Resource 自动删除；漂移 Resource 保留实际内容与 inventory，可以恢复实际状态后再 sync，或用 `dots forget <resource>` 放弃 ownership。
-
-`forget` 只删除 Applied Inventory 记录，不构建 Plan，也不读取或修改真实对象。Declaration 仍存在时，下次 sync 会把该对象视为未拥有：实际状态与声明一致则重新接管，否则报告 Collision。
-
-预览受管 target、inventory 动作和 sync hook：`dots sync --dry-run`。dry-run 显示但不执行 lifecycle hook；sync、status 和 dry-run 都忽略 Cargo binary declaration，不会因此执行 Cargo 或读取已安装 binary 的内容。
-
-## AI 工具链（skills / agents / hooks）
-
-`tree/home/.agents/` 是手写、跨 agent AI 资产的唯一真相源：`skills/` 分发到 `~/.codex/skills` 与 `~/.kimi/skills`（逐 skill 链接），Pi 直接发现 `~/.agents/skills`。全局指令和语言规则也由 `.agents/` 持有，agent hook 定义与规则分发到各工具配置目录。接入新工具时在 `dots.lua` 增加对应分发目标并运行 `dots sync`。
-
-[全局指令](../tree/home/.agents/AGENTS.md) 保存跨项目偏好；skill 的 description 只声明用途与关键排除，入口按任务链接所需 reference。明确的小改动直接完成，跨会话目标或用户指定的 Spec 使用 [Wayfinder](../tree/home/.agents/skills/wayfinder/SKILL.md)。验收、后续修正与 Git 操作的关系由其[完成规则](../tree/home/.agents/skills/wayfinder/SKILL.md#完成与修正)定义。
-
-Codex、Kimi Code 与 Pi 共用 `cli/crates/agent-hooks/` 的 Rust PreToolUse 判定引擎。各 adapter 通过同一个 `agent-hook` binary 保留 harness 协议差异；Pi 的 `ask` 由 extension 在有 UI 时显式确认，无 UI 时拒绝。`tree/home/.agents/hooks/pretool.toml` 负责高风险操作提示和工具偏好重定向。它是引导模型的启发式守卫，不替代 sandbox、permission 或系统权限。
-
-## 当前管理的主要配置
-
-- Shell：Zsh（自管 conf.d，无框架）+ Starship
-- 编辑器：Neovim（LazyVim）/ Vim
-- 终端：Kitty；文件管理器：Yazi；多路复用：Zellij；监控：btop
-- Linux 桌面：Hyprland（主，0.55+ Lua 入口）/ niri（备选）/ QuickShell（状态栏 + 控制中心）/ xremap / systemd user 单元
-- macOS：yabai / skhd / sketchybar / fcitx5
-- AI 工具：Codex / Pi / Kimi skills 与共享 PreToolUse 守卫，opencode
-
-以上是主要部分，完整清单以 `tree/` 实际内容为准。
-
-## 更多文档
-
-- [LUA_API.md](LUA_API.md) — `dots.lua` 全部 Lua API 的参考（参数、行为细节、坑与配方）
-
-## 注意事项
-
-- 顶层 `README.md` 是指向 `docs/README.md` 的符号链接；`AGENTS.md` 是项目指令的真实源文件。
-- `.gen/`、`.dots/` 是机器本地派生物，不入库。
-- 新机必须先准备 C 编译器、Cargo、Node 22.19+ 与 pnpm 11.18。系统包、rustup、Node、pnpm 和 AI CLI 由使用者管理；Cargo binary 由 `dots install` 安装或升级，Pi workspace 依赖由 sync lifecycle hook 安装。
+结论：如果目标是省事，这是造轮子；如果目标是精确掌控一个语义严格的小引擎、顺便练一套 Rust 架构（dots-core 纯逻辑与 bin 分离、plan/reconcile 划分），再加占住 AI 配置管理这个无人区，那这轮子造得值。它不是 chezmoi 的替代品，是另一物种。
